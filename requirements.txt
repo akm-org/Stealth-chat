@@ -1,0 +1,14 @@
+# Core Flask framework
+Flask==2.3.3
+
+# Cryptography library for AES-256-GCM encryption
+cryptography==41.0.7
+
+# QR code generation with PIL support
+qrcode[pil]==7.4.2
+
+# Additional dependencies (automatically installed with above packages)
+# Werkzeug==2.3.7  # Flask dependency
+# Jinja2==3.1.2     # Flask templating
+# Pillow>=8.0.0     # Image processing for QR codes
+# cffi>=1.12        # Cryptography dependency
