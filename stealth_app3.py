@@ -129,7 +129,7 @@ def login():
     </head>
     <body>
         <div class="container">
-            <h1>⚡ STEALTH ACCESS ⚡</h1>
+            <h1> STEALTH ACCESS </h1>
             <form method="POST">
                 <input type="password" name="password" placeholder="Enter Access Code" required autofocus>
                 <button type="submit">AUTHENTICATE</button>
@@ -226,7 +226,7 @@ def setup():
     </head>
     <body>
         <div class="container">
-            <h1>⚡ CHAT SESSION READY ⚡</h1>
+            <h1> CHAT SESSION READY </h1>
             <p>Share this URL with participants:</p>
             <div class="url-box">{{ chat_url }}</div>
             
@@ -352,7 +352,7 @@ def chat(session_id):
     </head>
     <body>
         <div class="header">
-            <h2>⚡ STEALTH CHAT ⚡</h2>
+            <h2> STEALTH CHAT ⚡</h2>
         </div>
         
         <div class="chat-container">
@@ -383,7 +383,7 @@ def chat(session_id):
         
         <div id="dragOverlay" class="drag-overlay">
             <div>
-                <h2>⚡ DROP FILES TO UPLOAD ⚡</h2>
+                <h2> DROP FILES TO UPLOAD </h2>
                 <p>Release to add files to chat</p>
             </div>
         </div>
@@ -879,8 +879,4 @@ def logout():
     return redirect(url_for('login'))
 
 if __name__ == '__main__':
-    print("🚀 Starting Stealth Messaging App...")
-    print("📍 Access at: http://localhost:5000")
-    print("🔑 Login password: secret123")
-    print("⚡ Ready for stealth communications!")
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    app.run(debug=True, host='0.0.0.0', port=15005)
