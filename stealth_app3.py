@@ -1,882 +1,1216 @@
 #!/usr/bin/env python3
 """
-Stealth Messaging App - Complete Flask Implementation
-Run with: python stealth_app.py
+GhostLine - Encrypted Ephemeral Chat System
+A single-file Python application for secure, anonymous communication
 """
 
 import os
-import io
+import uuid
+import time
+import json
 import base64
-import secrets
-import hashlib
+import threading
 from datetime import datetime, timedelta
-from flask import Flask, request, jsonify, session, redirect, url_for, render_template_string, send_file
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-from cryptography.hazmat.primitives import hashes
+from io import BytesIO
 import qrcode
+from flask import Flask, render_template_string, request, jsonify, send_file, redirect
+from flask_socketio import SocketIO, emit, join_room, leave_room
+import eventlet
+
+# Configuration
+FIXED_PASSWORD = "ghost2024"  # Fixed password for session creation
+SESSION_TIMEOUT = 3600  # 60 minutes in seconds
+WHISPER_TIMEOUT = 5  # 5 seconds for whisper messages
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB max file size
 
 app = Flask(__name__)
-app.secret_key = secrets.token_hex(32)
+app.config['SECRET_KEY'] = os.urandom(24)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 
 # In-memory storage
-chat_sessions = {}
-files = {}
-session_activity = {}
+SESSIONS = {}
+ACTIVE_USERS = {}
 
-# Constants
-SALT = b"stealth_salt"
-SESSION_TIMEOUT = 30  # minutes
-MAX_FILE_SIZE = 16 * 1024 * 1024  # 16MB
-
-def generate_key_from_session_key(session_key):
-    """Generate AES key from 11-digit session key"""
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(),
-        length=32,
-        salt=SALT,
-        iterations=100000,
-    )
-    return kdf.derive(session_key.encode())
-
-def encrypt_data(data, key):
-    """Encrypt data using AES-256-GCM"""
-    nonce = os.urandom(12)
-    cipher = Cipher(algorithms.AES(key), modes.GCM(nonce))
-    encryptor = cipher.encryptor()
-    
-    if isinstance(data, str):
-        data = data.encode()
-    
-    ciphertext = encryptor.update(data) + encryptor.finalize()
-    return base64.b64encode(nonce + encryptor.tag + ciphertext).decode()
-
-def decrypt_data(encrypted_data, key):
-    """Decrypt data using AES-256-GCM"""
-    try:
-        data = base64.b64decode(encrypted_data.encode())
-        nonce = data[:12]
-        tag = data[12:28]
-        ciphertext = data[28:]
+# HTML Template
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GhostLine</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
         
-        cipher = Cipher(algorithms.AES(key), modes.GCM(nonce, tag))
-        decryptor = cipher.decryptor()
+        body {
+            font-family: 'SF Mono', 'Monaco', 'Inconsolata', 'Roboto Mono', monospace;
+            background: #0a0a0a;
+            color: #e0e0e0;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
         
-        return decryptor.update(ciphertext) + decryptor.finalize()
-    except Exception:
-        return None
-
-def check_session_expired():
-    """Check if session has expired"""
-    user_id = session.get('authenticated')
-    if user_id and user_id in session_activity:
-        last_activity = session_activity[user_id]
-        if datetime.now() - last_activity > timedelta(minutes=SESSION_TIMEOUT):
-            session.clear()
-            del session_activity[user_id]
-            return True
-    return False
-
-def update_activity():
-    """Update user activity timestamp"""
-    user_id = session.get('authenticated')
-    if user_id:
-        session_activity[user_id] = datetime.now()
-
-@app.route('/')
-def login():
-    """Login page"""
-    if check_session_expired():
-        return redirect(url_for('login'))
-    
-    if session.get('authenticated'):
-        return redirect(url_for('setup'))
-    
-    html = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Stealth Login</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <style>
-            * { margin: 0; padding: 0; box-sizing: border-box; }
-            body { 
-                background: #000; color: #00ffff; font-family: 'Courier New', monospace; 
-                min-height: 100vh; display: flex; align-items: center; justify-content: center;
-                background: radial-gradient(circle, #001122 0%, #000000 100%);
+        .container {
+            width: 100%;
+            height: 100%;
+            padding: 20px;
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+            padding: 20px 0;
+            border-bottom: 1px solid #333;
+        }
+        
+        .logo {
+            font-size: 28px;
+            font-weight: bold;
+            color: #fff;
+            margin-bottom: 8px;
+        }
+        
+        .tagline {
+            font-size: 12px;
+            color: #888;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        
+        .login-form, .session-form {
+            background: #1a1a1a;
+            border: 1px solid #333;
+            border-radius: 8px;
+            padding: 30px;
+            margin: auto;
+            max-width: 400px;
+        }
+        
+        .form-group {
+            margin-bottom: 20px;
+        }
+        
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-size: 14px;
+            color: #ccc;
+        }
+        
+        input[type="password"], input[type="text"] {
+            width: 100%;
+            padding: 12px;
+            background: #000;
+            border: 1px solid #444;
+            border-radius: 4px;
+            color: #fff;
+            font-family: inherit;
+            font-size: 14px;
+        }
+        
+        input:focus {
+            outline: none;
+            border-color: #666;
+        }
+        
+        .btn {
+            background: #2a2a2a;
+            color: #fff;
+            border: 1px solid #444;
+            padding: 12px 24px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-family: inherit;
+            font-size: 14px;
+            transition: all 0.2s;
+        }
+        
+        .btn:hover {
+            background: #3a3a3a;
+            border-color: #666;
+        }
+        
+        .btn:active {
+            background: #1a1a1a;
+        }
+        
+        .session-info {
+            background: #1a1a1a;
+            border: 1px solid #333;
+            border-radius: 8px;
+            padding: 20px;
+            margin: auto;
+            max-width: 500px;
+            text-align: center;
+        }
+        
+        .session-url {
+            background: #000;
+            padding: 12px;
+            border-radius: 4px;
+            font-family: inherit;
+            font-size: 12px;
+            color: #0ff;
+            word-break: break-all;
+            margin: 10px 0;
+        }
+        
+        .qr-container {
+            margin: 20px 0;
+        }
+        
+        .qr-code {
+            max-width: 200px;
+            height: auto;
+            border: 2px solid #333;
+            border-radius: 8px;
+        }
+        
+        .chat-container {
+            display: flex;
+            flex-direction: column;
+            height: calc(100vh - 140px);
+            background: #1a1a1a;
+            border: 1px solid #333;
+            border-radius: 8px;
+            overflow: hidden;
+            flex: 1;
+        }
+        
+        .chat-header {
+            background: #2a2a2a;
+            padding: 15px 20px;
+            border-bottom: 1px solid #333;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .room-info {
+            font-size: 14px;
+            color: #ccc;
+        }
+        
+        .user-count {
+            font-size: 12px;
+            color: #888;
+        }
+        
+        .messages {
+            flex: 1;
+            overflow-y: auto;
+            padding: 20px;
+            scroll-behavior: smooth;
+        }
+        
+        .message {
+            margin-bottom: 15px;
+            padding: 12px;
+            background: #0f0f0f;
+            border-radius: 6px;
+        }
+        
+        .message.own {
+            background: #1a2332;
+            margin-left: 20%;
+        }
+        
+        .message.whisper {
+            background: #2a1a2a;
+            border-left: 3px solid #8b5cf6;
+            animation: whisper-fade 5s forwards;
+        }
+        
+        @keyframes whisper-fade {
+            0% { opacity: 1; }
+            80% { opacity: 1; }
+            100% { opacity: 0.3; }
+        }
+        
+        .message-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+        
+        .message-sender {
+            font-size: 12px;
+            font-weight: bold;
+            color: #0ff;
+        }
+        
+        .message-time {
+            font-size: 11px;
+            color: #666;
+        }
+        
+        .message-content {
+            font-size: 14px;
+            line-height: 1.4;
+            word-wrap: break-word;
+        }
+        
+        .file-message {
+            background: #1a1a2a;
+            border-left: 3px solid #0ff;
+        }
+        
+        .file-link {
+            color: #0ff;
+            text-decoration: none;
+            font-size: 13px;
+        }
+        
+        .file-link:hover {
+            text-decoration: underline;
+        }
+        
+        .input-area {
+            background: #2a2a2a;
+            padding: 20px;
+            border-top: 1px solid #333;
+        }
+        
+        .input-container {
+            display: flex;
+            gap: 10px;
+            align-items: flex-end;
+        }
+        
+        .message-input {
+            flex: 1;
+            padding: 12px;
+            background: #000;
+            border: 1px solid #444;
+            border-radius: 4px;
+            color: #fff;
+            font-family: inherit;
+            font-size: 14px;
+            resize: none;
+            max-height: 100px;
+        }
+        
+        .file-input {
+            display: none;
+        }
+        
+        .file-btn {
+            background: #1a3a1a;
+            border-color: #2a5a2a;
+        }
+        
+        .file-btn:hover {
+            background: #2a4a2a;
+        }
+        
+        .send-btn {
+            background: #1a2a3a;
+            border-color: #2a4a6a;
+        }
+        
+        .send-btn:hover {
+            background: #2a3a4a;
+        }
+        
+        .file-upload-area {
+            background: #2a2a2a;
+            border: 2px dashed #444;
+            border-radius: 8px;
+            padding: 20px;
+            text-align: center;
+            margin-bottom: 15px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        
+        .file-upload-area:hover {
+            border-color: #666;
+            background: #333;
+        }
+        
+        .file-upload-area.drag-over {
+            border-color: #0ff;
+            background: #1a2a2a;
+        }
+        
+        .file-list {
+            background: #1a1a1a;
+            border: 1px solid #333;
+            border-radius: 4px;
+            max-height: 120px;
+            overflow-y: auto;
+            margin-bottom: 10px;
+            display: none;
+        }
+        
+        .file-item {
+            padding: 8px 12px;
+            border-bottom: 1px solid #333;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 12px;
+        }
+        
+        .file-item:last-child {
+            border-bottom: none;
+        }
+        
+        .file-remove {
+            background: #3a1a1a;
+            border: 1px solid #5a2a2a;
+            color: #ff6b6b;
+            padding: 2px 6px;
+            border-radius: 3px;
+            cursor: pointer;
+            font-size: 10px;
+        }
+        
+        .file-remove:hover {
+            background: #4a2a2a;
+        }
+        
+        .error {
+            background: #3a1a1a;
+            color: #ff6b6b;
+            padding: 10px;
+            border-radius: 4px;
+            margin-bottom: 20px;
+            font-size: 14px;
+        }
+        
+        .success {
+            background: #1a3a1a;
+            color: #51cf66;
+            padding: 10px;
+            border-radius: 4px;
+            margin-bottom: 20px;
+            font-size: 14px;
+        }
+        
+        @media (max-width: 768px) {
+            .container {
+                padding: 10px;
             }
-            .container { 
-                background: rgba(0,20,40,0.8); border: 2px solid #00ffff; 
-                padding: 30px; border-radius: 10px; text-align: center;
-                box-shadow: 0 0 20px rgba(0,255,255,0.3);
-                min-width: 300px;
-            }
-            h1 { margin-bottom: 20px; text-shadow: 0 0 10px #00ffff; }
-            input { 
-                background: #001122; border: 1px solid #00ffff; color: #00ffff; 
-                padding: 10px; margin: 10px 0; width: 100%; border-radius: 5px;
-                font-family: inherit;
-            }
-            input:focus { outline: none; box-shadow: 0 0 10px rgba(0,255,255,0.5); }
-            button { 
-                background: #003366; border: 1px solid #00ffff; color: #00ffff; 
-                padding: 10px 20px; margin: 10px 0; cursor: pointer; border-radius: 5px;
-                width: 100%; font-family: inherit; transition: all 0.3s;
-            }
-            button:hover { background: #004488; box-shadow: 0 0 10px rgba(0,255,255,0.5); }
-            .error { color: #ff4444; margin: 10px 0; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1> STEALTH ACCESS </h1>
-            <form method="POST">
-                <input type="password" name="password" placeholder="Enter Access Code" required autofocus>
-                <button type="submit">AUTHENTICATE</button>
-            </form>
-            {% if error %}
-            <div class="error">{{ error }}</div>
-            {% endif %}
-        </div>
-    </body>
-    </html>
-    """
-    
-    if request.method == 'POST':
-        password = request.form.get('password')
-        if password == 'secret123':
-            user_id = secrets.token_hex(16)
-            session['authenticated'] = user_id
-            session_activity[user_id] = datetime.now()
-            return redirect(url_for('setup'))
-        else:
-            return render_template_string(html, error="ACCESS DENIED"), 403
-    
-    return render_template_string(html)
-
-@app.route('/', methods=['POST'])
-def login_post():
-    return login()
-
-@app.route('/setup')
-def setup():
-    """Chat setup page"""
-    if check_session_expired():
-        return redirect(url_for('login'))
-    
-    if not session.get('authenticated'):
-        return redirect(url_for('login'))
-    
-    update_activity()
-    
-    # Generate chat session
-    session_id = secrets.token_urlsafe(16)
-    chat_url = f"{request.host_url}chat/{session_id}"
-    
-    # Generate QR code
-    qr = qrcode.QRCode(version=1, box_size=10, border=5)
-    qr.add_data(chat_url)
-    qr.make(fit=True)
-    
-    img = qr.make_image(fill_color="cyan", back_color="black")
-    buffer = io.BytesIO()
-    img.save(buffer, format='PNG')
-    qr_b64 = base64.b64encode(buffer.getvalue()).decode()
-    
-    session['chat_url'] = session_id
-    
-    html = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Chat Setup</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <style>
-            * { margin: 0; padding: 0; box-sizing: border-box; }
-            body { 
-                background: #000; color: #00ffff; font-family: 'Courier New', monospace; 
-                min-height: 100vh; padding: 20px;
-                background: radial-gradient(circle, #001122 0%, #000000 100%);
-            }
-            .container { 
-                max-width: 600px; margin: 0 auto; text-align: center;
-                background: rgba(0,20,40,0.8); border: 2px solid #00ffff; 
-                padding: 30px; border-radius: 10px;
-                box-shadow: 0 0 20px rgba(0,255,255,0.3);
-            }
-            h1 { margin-bottom: 20px; text-shadow: 0 0 10px #00ffff; }
-            .url-box { 
-                background: #001122; border: 1px solid #00ffff; 
-                padding: 15px; margin: 20px 0; border-radius: 5px;
-                word-break: break-all; font-size: 14px;
-            }
-            .qr-code { margin: 20px 0; }
-            button, a { 
-                background: #003366; border: 1px solid #00ffff; color: #00ffff; 
-                padding: 10px 20px; margin: 10px; cursor: pointer; border-radius: 5px;
-                text-decoration: none; display: inline-block; font-family: inherit;
-                transition: all 0.3s;
-            }
-            button:hover, a:hover { background: #004488; box-shadow: 0 0 10px rgba(0,255,255,0.5); }
-            @media (max-width: 600px) {
-                .container { margin: 10px; padding: 20px; }
-                .url-box { font-size: 12px; }
-            }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1> CHAT SESSION READY </h1>
-            <p>Share this URL with participants:</p>
-            <div class="url-box">{{ chat_url }}</div>
             
-            <div class="qr-code">
-                <p>Or scan QR code:</p>
-                <img src="data:image/png;base64,{{ qr_code }}" alt="QR Code" style="max-width: 200px; margin: 10px;">
-            </div>
+            .header {
+                margin-bottom: 20px;
+                padding: 15px 0;
+            }
             
-            <a href="/chat/{{ session_id }}">ENTER CHAT</a>
-            <button onclick="copyUrl()">COPY URL</button>
-            <a href="/logout">LOGOUT</a>
-        </div>
-        
-        <script>
-            function copyUrl() {
-                navigator.clipboard.writeText("{{ chat_url }}").then(() => {
-                    alert("URL copied to clipboard!");
-                });
+            .chat-container {
+                height: calc(100vh - 120px);
             }
-        </script>
-    </body>
-    </html>
-    """
-    
-    return render_template_string(html, chat_url=chat_url, qr_code=qr_b64, session_id=session_id)
-
-@app.route('/chat/<session_id>')
-def chat(session_id):
-    """Chat interface"""
-    html = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Stealth Chat</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <style>
-            * { margin: 0; padding: 0; box-sizing: border-box; }
-            body { 
-                background: #000; color: #00ffff; font-family: 'Courier New', monospace; 
-                height: 100vh; display: flex; flex-direction: column;
-                background: radial-gradient(circle, #001122 0%, #000000 100%);
+            
+            .message.own {
+                margin-left: 10%;
             }
-            .header { 
-                background: rgba(0,20,40,0.9); border-bottom: 1px solid #00ffff; 
-                padding: 10px; text-align: center; text-shadow: 0 0 10px #00ffff;
+            
+            .input-container {
+                flex-direction: column;
+                gap: 10px;
             }
-            .chat-container { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
-            .join-form { 
-                padding: 20px; text-align: center; border-bottom: 1px solid #00ffff;
-                background: rgba(0,20,40,0.5);
+            
+            .btn {
+                width: 100%;
             }
-            .join-form input { 
-                background: #001122; border: 1px solid #00ffff; color: #00ffff; 
-                padding: 8px; margin: 5px; border-radius: 3px; font-family: inherit;
+            
+            .login-form, .session-form {
+                padding: 20px;
             }
-            .join-form button { 
-                background: #003366; border: 1px solid #00ffff; color: #00ffff; 
-                padding: 8px 15px; margin: 5px; cursor: pointer; border-radius: 3px;
-                font-family: inherit; transition: all 0.3s;
-            }
-            .join-form button:hover { background: #004488; }
-            .messages { 
-                flex: 1; overflow-y: auto; padding: 10px; 
-                scrollbar-width: thin; scrollbar-color: #00ffff #001122;
-                padding-bottom: 200px; /* Space for fixed input area */
-            }
-            .message { 
-                margin: 8px 0; padding: 8px; background: rgba(0,20,40,0.6); 
-                border-radius: 5px; border-left: 3px solid #00ffff;
-                position: relative; group;
-            }
-            .message:hover .delete-btn { opacity: 1; }
-            .delete-btn {
-                position: absolute; top: 5px; right: 5px; 
-                background: #660000; border: 1px solid #ff4444; color: #ff4444;
-                padding: 2px 6px; border-radius: 3px; cursor: pointer;
-                opacity: 0; transition: opacity 0.3s; font-size: 12px;
-            }
-            .delete-btn:hover { background: #880000; }
-            .whisper { border-left-color: #ffff00; background: rgba(40,40,0,0.3); }
-            .input-area { 
-                position: fixed; bottom: 0; left: 0; right: 0;
-                border-top: 1px solid #00ffff; padding: 10px; 
-                background: rgba(0,20,40,0.95); backdrop-filter: blur(10px);
-                z-index: 1000;
-            }
-            .input-row { display: flex; gap: 10px; margin-bottom: 10px; }
-            .input-row input { 
-                flex: 1; background: #001122; border: 1px solid #00ffff; color: #00ffff; 
-                padding: 8px; border-radius: 3px; font-family: inherit;
-            }
-            .input-row button { 
-                background: #003366; border: 1px solid #00ffff; color: #00ffff; 
-                padding: 8px 15px; cursor: pointer; border-radius: 3px;
-                font-family: inherit; transition: all 0.3s; white-space: nowrap;
-            }
-            .input-row button:hover { background: #004488; }
-            .file-drop { 
-                border: 2px dashed #00ffff; padding: 20px; text-align: center; 
-                border-radius: 5px; margin-bottom: 10px; transition: all 0.3s;
-                background: rgba(0,30,60,0.3);
-            }
-            .file-drop.dragover { border-color: #ffff00; background: rgba(40,40,0,0.3); }
-            .drag-overlay {
-                position: fixed; top: 0; left: 0; right: 0; bottom: 0;
-                background: rgba(0,255,255,0.1); border: 3px dashed #00ffff;
-                display: none; z-index: 9999; align-items: center; justify-content: center;
-                font-size: 24px; text-align: center; color: #00ffff;
-                text-shadow: 0 0 20px #00ffff;
-            }
-            .drag-overlay.active { display: flex; }
-            .file-list { margin: 10px 0; }
-            .file-item { 
-                display: flex; justify-content: space-between; align-items: center;
-                padding: 5px; background: rgba(0,20,40,0.5); margin: 5px 0; border-radius: 3px;
-            }
-            .hidden { display: none; }
-            @media (max-width: 600px) {
-                .input-row { flex-direction: column; }
-                .input-row button { width: 100%; }
-            }
-        </style>
-    </head>
-    <body>
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
         <div class="header">
-            <h2> STEALTH CHAT ⚡</h2>
+            <div class="logo">GhostLine</div>
+            <div class="tagline">Encrypted • Ephemeral • Anonymous</div>
         </div>
-        
-        <div class="chat-container">
-            <div id="joinForm" class="join-form">
-                <input type="text" id="username" placeholder="Username" required>
-                <input type="text" id="sessionKey" placeholder="11-digit session key" pattern="[0-9]{11}" required>
-                <button onclick="joinChat()">JOIN CHAT</button>
+        <div id="content">
+            {% if page == 'login' %}
+            <div class="login-form">
+                <div class="form-group">
+                    <label for="password">Enter Password</label>
+                    <input type="password" id="password" placeholder="Enter the secret password">
+                </div>
+                <button class="btn" onclick="login()">Access System</button>
+                <div id="error" class="error" style="display: none;"></div>
             </div>
-            
-            <div id="chatInterface" class="hidden">
-                <div id="messages" class="messages"></div>
-                
+            {% elif page == 'session' %}
+            <div class="session-info">
+                <h3>Session Created</h3>
+                <p>Share this URL to invite others:</p>
+                <div class="session-url">{{ session_url }}</div>
+                <div class="qr-container">
+                    <img src="data:image/png;base64,{{ qr_code }}" alt="QR Code" class="qr-code">
+                </div>
+                <button class="btn" onclick="window.location.href='{{ session_url }}'">Enter Chat</button>
+            </div>
+            {% elif page == 'room_entry' %}
+            <div class="session-form">
+                <div class="form-group">
+                    <label for="username">Your Name</label>
+                    <input type="text" id="username" placeholder="Enter a temporary username" maxlength="20">
+                </div>
+                <div class="form-group">
+                    <label for="roomkey">Room Key (11 digits)</label>
+                    <input type="text" id="roomkey" placeholder="Enter 11-digit room key" maxlength="11" pattern="[0-9]{11}">
+                </div>
+                <button class="btn" onclick="joinRoom()">Join Room</button>
+                <div id="error" class="error" style="display: none;"></div>
+            </div>
+            {% elif page == 'chat' %}
+            <div class="chat-container">
+                <div class="chat-header">
+                    <div class="room-info">Room: {{ room_key }} | User: {{ username }}</div>
+                    <div class="user-count" id="userCount">1 user online</div>
+                </div>
+                <div class="messages" id="messages"></div>
                 <div class="input-area">
-                    <div class="file-drop" id="fileDrop">
-                        <p>📁 Drag & drop files here or click to select</p>
-                        <input type="file" id="fileInput" multiple style="display: none;">
+                    <div class="file-upload-area" id="fileUploadArea" onclick="document.getElementById('fileInput').click()">
+                        <div>📎 Click to select files or drag & drop anywhere</div>
+                        <div style="font-size: 11px; color: #888; margin-top: 5px;">Multiple files supported • Max 10MB each</div>
                     </div>
-                    <div id="fileList" class="file-list"></div>
-                    
-                    <div class="input-row">
-                        <input type="text" id="messageInput" placeholder="Type message... (use !whisper for whisper messages)">
-                        <button onclick="sendMessage()">SEND</button>
-                        <button onclick="sendFiles()">SEND FILES</button>
+                    <div class="file-list" id="fileList"></div>
+                    <div class="input-container">
+                        <textarea id="messageInput" class="message-input" placeholder="Type your message... (start with !whisper for self-destructing messages)" rows="1"></textarea>
+                        <input type="file" id="fileInput" class="file-input" multiple>
+                        <button class="btn send-btn" onclick="sendMessage()">Send</button>
                     </div>
                 </div>
             </div>
-        </div>
+        .drag-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.9);
+            display: none;
+            justify-content: center;
+            align-items: center;
+            z-index: 1000;
+            font-size: 24px;
+            color: #0ff;
+            border: 3px dashed #0ff;
+        }
         
-        <div id="dragOverlay" class="drag-overlay">
-            <div>
-                <h2> DROP FILES TO UPLOAD </h2>
-                <p>Release to add files to chat</p>
-            </div>
+        .drag-overlay.active {
+            display: flex;
+        }
+            {% endif %}
         </div>
-        
-        <script>
-            let username = '';
-            let sessionKey = '';
-            let sessionId = '{{ session_id }}';
-            let selectedFiles = [];
-            let messageInterval;
-            let dragCounter = 0;
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+    <script>
+        // Global variables
+        let socket = null;
+        let currentUser = '';
+        let currentRoom = '';
+        let dragCounter = 0;
+        let selectedFiles = [];
+        let fileUploadInProgress = false;
+
+        // Login functionality
+        function login() {
+            const password = document.getElementById('password').value;
             
-            // Global drag and drop
-            document.addEventListener('dragenter', (e) => {
-                e.preventDefault();
-                dragCounter++;
-                if (dragCounter === 1) {
-                    document.getElementById('dragOverlay').classList.add('active');
+            fetch('/login', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ password: password })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    window.location.href = data.redirect;
+                } else {
+                    showError(data.error);
                 }
+            })
+            .catch(error => {
+                showError('Connection error');
+            });
+        }
+
+        // Room joining functionality
+        function joinRoom() {
+            const username = document.getElementById('username').value.trim();
+            const roomkey = document.getElementById('roomkey').value.trim();
+            
+            if (!username || username.length < 1) {
+                showError('Please enter a username');
+                return;
+            }
+            
+            if (!roomkey || roomkey.length !== 11 || !/^\d{11}$/.test(roomkey)) {
+                showError('Room key must be exactly 11 digits');
+                return;
+            }
+            
+            const sessionId = window.location.pathname.substring(1);
+            window.location.href = `/chat/${sessionId}/${roomkey}/${encodeURIComponent(username)}`;
+        }
+
+        // Chat functionality
+        {% if page == 'chat' %}
+        function initializeChat() {
+            currentUser = '{{ username }}';
+            currentRoom = '{{ room_key }}';
+            
+            socket = io();
+            
+            socket.emit('join', {
+                session_id: '{{ session_id }}',
+                room_key: '{{ room_key }}',
+                username: '{{ username }}'
             });
             
-            document.addEventListener('dragleave', (e) => {
-                e.preventDefault();
-                dragCounter--;
-                if (dragCounter === 0) {
-                    document.getElementById('dragOverlay').classList.remove('active');
-                }
+            socket.on('message', function(data) {
+                displayMessage(data);
             });
             
-            document.addEventListener('dragover', (e) => {
-                e.preventDefault();
+            socket.on('user_joined', function(data) {
+                updateUserCount(data.user_count);
             });
             
-            document.addEventListener('drop', (e) => {
-                e.preventDefault();
-                dragCounter = 0;
-                document.getElementById('dragOverlay').classList.remove('active');
-                
-                if (document.getElementById('chatInterface').classList.contains('hidden')) {
-                    return; // Don't handle drops if not in chat
-                }
-                
-                handleFiles(e.dataTransfer.files);
+            socket.on('user_left', function(data) {
+                updateUserCount(data.user_count);
             });
             
-            // File drag and drop
-            const fileDrop = document.getElementById('fileDrop');
-            const fileInput = document.getElementById('fileInput');
-            const fileList = document.getElementById('fileList');
-            
-            fileDrop.addEventListener('click', () => fileInput.click());
-            fileDrop.addEventListener('dragover', (e) => {
-                e.preventDefault();
-                fileDrop.classList.add('dragover');
-            });
-            fileDrop.addEventListener('dragleave', () => {
-                fileDrop.classList.remove('dragover');
-            });
-            fileDrop.addEventListener('drop', (e) => {
-                e.preventDefault();
-                fileDrop.classList.remove('dragover');
-                handleFiles(e.dataTransfer.files);
-            });
-            fileInput.addEventListener('change', (e) => {
-                handleFiles(e.target.files);
+            socket.on('file_uploaded', function(data) {
+                displayMessage(data);
             });
             
-            function handleFiles(files) {
-                for (let file of files) {
-                    if (file.size > 16 * 1024 * 1024) {
-                        alert(`File ${file.name} is too large (max 16MB)`);
-                        continue;
-                    }
-                    selectedFiles.push(file);
-                }
-                updateFileList();
-            }
+            // Load existing messages
+            loadMessages();
             
-            function updateFileList() {
-                fileList.innerHTML = '';
-                selectedFiles.forEach((file, index) => {
-                    const div = document.createElement('div');
-                    div.className = 'file-item';
-                    div.innerHTML = `
-                        <span>${file.name} (${(file.size/1024/1024).toFixed(2)}MB)</span>
-                        <button onclick="removeFile(${index})" style="background: #660000; border: 1px solid #ff4444; color: #ff4444; padding: 2px 8px; border-radius: 3px;">×</button>
-                    `;
-                    fileList.appendChild(div);
-                });
-            }
+            // Setup drag and drop
+            setupDragAndDrop();
             
-            function removeFile(index) {
-                selectedFiles.splice(index, 1);
-                updateFileList();
-            }
-            
-            function joinChat() {
-                username = document.getElementById('username').value.trim();
-                sessionKey = document.getElementById('sessionKey').value.trim();
-                
-                if (!username || !sessionKey) {
-                    alert('Please enter username and session key');
-                    return;
-                }
-                
-                if (!/^[0-9]{11}$/.test(sessionKey)) {
-                    alert('Session key must be exactly 11 digits');
-                    return;
-                }
-                
-                fetch('/join_chat', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({
-                        session_id: sessionId,
-                        username: username,
-                        session_key: sessionKey
-                    })
-                })
-                .then(r => r.json())
-                .then(data => {
-                    if (data.success) {
-                        document.getElementById('joinForm').classList.add('hidden');
-                        document.getElementById('chatInterface').classList.remove('hidden');
-                        startMessagePolling();
-                    } else {
-                        alert(data.error || 'Failed to join chat');
-                    }
-                });
-            }
-            
-            function sendMessage() {
-                const messageInput = document.getElementById('messageInput');
-                const message = messageInput.value.trim();
-                
-                if (!message) return;
-                
-                fetch('/send_message', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({
-                        session_key: sessionKey,
-                        message: message,
-                        username: username
-                    })
-                })
-                .then(r => r.json())
-                .then(data => {
-                    if (data.success) {
-                        messageInput.value = '';
-                    } else {
-                        alert(data.error || 'Failed to send message');
-                    }
-                });
-            }
-            
-            function sendFiles() {
-                if (selectedFiles.length === 0) {
-                    alert('No files selected');
-                    return;
-                }
-                
-                const formData = new FormData();
-                formData.append('session_key', sessionKey);
-                formData.append('username', username);
-                
-                selectedFiles.forEach(file => {
-                    formData.append('files', file);
-                });
-                
-                fetch('/upload_files', {
-                    method: 'POST',
-                    body: formData
-                })
-                .then(r => r.json())
-                .then(data => {
-                    if (data.success) {
-                        selectedFiles = [];
-                        updateFileList();
-                        fileInput.value = '';
-                    } else {
-                        alert(data.error || 'Failed to upload files');
-                    }
-                });
-            }
-            
-            function startMessagePolling() {
-                messageInterval = setInterval(() => {
-                    fetch(`/get_messages?session_key=${sessionKey}`)
-                    .then(r => r.json())
-                    .then(data => {
-                        if (data.success) {
-                            displayMessages(data.messages);
-                        }
-                    });
-                }, 1000);
-            }
-            
-            function displayMessages(messages) {
-                const messagesDiv = document.getElementById('messages');
-                messagesDiv.innerHTML = '';
-                
-                messages.forEach(msg => {
-                    const div = document.createElement('div');
-                    div.className = 'message' + (msg.whisper ? ' whisper' : '');
-                    
-                    let content = `<strong>${msg.username}</strong> (${msg.timestamp}): `;
-                    
-                    if (msg.type === 'file') {
-                        content += `📁 <a href="/download_file/${msg.file_id}" style="color: #00ffff;">${msg.filename}</a> (${msg.filesize})`;
-                    } else {
-                        content += msg.message;
-                    }
-                    
-                    if (msg.whisper) {
-                        content += ' <em>(whisper)</em>';
-                    }
-                    
-                    // Add delete button
-                    content += `<button class="delete-btn" onclick="deleteMessage('${msg.id}')">×</button>`;
-                    
-                    div.innerHTML = content;
-                    messagesDiv.appendChild(div);
-                });
-                
-                messagesDiv.scrollTop = messagesDiv.scrollHeight;
-            }
-            
-            function deleteMessage(messageId) {
-                if (!confirm('Delete this message?')) return;
-                
-                fetch('/delete_message', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({
-                        session_key: sessionKey,
-                        message_id: messageId,
-                        username: username
-                    })
-                })
-                .then(r => r.json())
-                .then(data => {
-                    if (!data.success) {
-                        alert(data.error || 'Failed to delete message');
-                    }
-                });
-            }
-            
-            // Enter key to send message
-            document.getElementById('messageInput').addEventListener('keypress', (e) => {
-                if (e.key === 'Enter') {
+            // Setup input handlers
+            const messageInput = document.getElementById('messageInput');
+            messageInput.addEventListener('keydown', function(e) {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault();
                     sendMessage();
                 }
+                
+                // Auto-resize textarea
+                this.style.height = 'auto';
+                this.style.height = this.scrollHeight + 'px';
             });
             
-            // Enter key to join chat
-            document.getElementById('sessionKey').addEventListener('keypress', (e) => {
-                if (e.key === 'Enter') {
-                    joinChat();
+            // Clear files when typing a message
+            messageInput.addEventListener('input', function() {
+                if (this.value.trim() && selectedFiles.length > 0) {
+                    selectedFiles = [];
+                    updateFileList();
                 }
             });
-        </script>
-    </body>
-    </html>
-    """
-    
-    return render_template_string(html, session_id=session_id)
+            
+            // File input handler
+            document.getElementById('fileInput').addEventListener('change', function(e) {
+                addFiles(Array.from(e.target.files));
+                this.value = ''; // Clear the input
+            });
+        }
+        
+        function loadMessages() {
+            fetch(`/api/messages/{{ session_id }}/{{ room_key }}`)
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        data.messages.forEach(message => {
+                            displayMessage(message, false);
+                        });
+                        scrollToBottom();
+                    }
+                });
+        }
+        
+        function sendMessage() {
+            // If files are selected, send them instead of text
+            if (selectedFiles.length > 0) {
+                sendFiles();
+                return;
+            }
+            
+            const input = document.getElementById('messageInput');
+            const message = input.value.trim();
+            
+            if (!message) return;
+            
+            const isWhisper = message.startsWith('!whisper ');
+            const messageData = {
+                session_id: '{{ session_id }}',
+                room_key: '{{ room_key }}',
+                username: '{{ username }}',
+                message: isWhisper ? message.substring(9) : message,
+                whisper: isWhisper
+            };
+            
+            socket.emit('send_message', messageData);
+            input.value = '';
+            input.style.height = 'auto';
+        }
+        
+        function sendFiles() {
+            if (selectedFiles.length === 0 || fileUploadInProgress) return;
+            
+            fileUploadInProgress = true;
+            
+            const formData = new FormData();
+            formData.append('session_id', '{{ session_id }}');
+            formData.append('room_key', '{{ room_key }}');
+            formData.append('username', '{{ username }}');
+            
+            selectedFiles.forEach(file => {
+                formData.append('files', file);
+            });
+            
+            fetch('/upload', {
+                method: 'POST',
+                body: formData
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (!data.success) {
+                    showError(data.error || 'Upload failed');
+                } else {
+                    // Clear selected files
+                    selectedFiles = [];
+                    updateFileList();
+                }
+            })
+            .catch(error => {
+                showError('Upload failed');
+            })
+            .finally(() => {
+                fileUploadInProgress = false;
+            });
+        }
+        
+        function displayMessage(data, scroll = true) {
+            const messagesDiv = document.getElementById('messages');
+            const messageDiv = document.createElement('div');
+            
+            const isOwn = data.sender === currentUser;
+            const isWhisper = data.whisper;
+            const isFile = data.type === 'file';
+            
+            messageDiv.className = `message ${isOwn ? 'own' : ''} ${isWhisper ? 'whisper' : ''} ${isFile ? 'file-message' : ''}`;
+            messageDiv.id = `msg-${data.id}`;
+            
+            const time = new Date(data.timestamp * 1000).toLocaleTimeString();
+            
+            let content = '';
+            if (isFile) {
+                const files = JSON.parse(data.content);
+                content = files.map(file => 
+                    `<a href="/file/${data.id}/${file.name}" class="file-link" target="_blank">📎 ${file.name} (${formatFileSize(file.size)})</a>`
+                ).join('<br>');
+            } else {
+                content = escapeHtml(data.content);
+            }
+            
+            messageDiv.innerHTML = `
+                <div class="message-header">
+                    <span class="message-sender">${escapeHtml(data.sender)}${isWhisper ? ' (whisper)' : ''}</span>
+                    <span class="message-time">${time}</span>
+                </div>
+                <div class="message-content">${content}</div>
+            `;
+            
+            messagesDiv.appendChild(messageDiv);
+            
+            if (isWhisper) {
+                setTimeout(() => {
+                    const element = document.getElementById(`msg-${data.id}`);
+                    if (element) {
+                        element.style.opacity = '0.3';
+                        element.style.pointerEvents = 'none';
+                    }
+                }, 5000);
+            }
+            
+            if (scroll) {
+                scrollToBottom();
+            }
+        }
+        
+        function setupDragAndDrop() {
+            const dragOverlay = document.getElementById('dragOverlay');
+            const fileUploadArea = document.getElementById('fileUploadArea');
+            
+            // Global drag and drop
+            document.addEventListener('dragenter', function(e) {
+                e.preventDefault();
+                dragCounter++;
+                dragOverlay.classList.add('active');
+            });
+            
+            document.addEventListener('dragleave', function(e) {
+                dragCounter--;
+                if (dragCounter === 0) {
+                    dragOverlay.classList.remove('active');
+                }
+            });
+            
+            document.addEventListener('dragover', function(e) {
+                e.preventDefault();
+            });
+            
+            document.addEventListener('drop', function(e) {
+                e.preventDefault();
+                dragCounter = 0;
+                dragOverlay.classList.remove('active');
+                
+                if (e.dataTransfer.files.length > 0) {
+                    addFiles(Array.from(e.dataTransfer.files));
+                }
+            });
+            
+            // File upload area specific
+            fileUploadArea.addEventListener('dragenter', function(e) {
+                e.preventDefault();
+                this.classList.add('drag-over');
+            });
+            
+            fileUploadArea.addEventListener('dragleave', function(e) {
+                e.preventDefault();
+                this.classList.remove('drag-over');
+            });
+            
+            fileUploadArea.addEventListener('dragover', function(e) {
+                e.preventDefault();
+            });
+            
+            fileUploadArea.addEventListener('drop', function(e) {
+                e.preventDefault();
+                this.classList.remove('drag-over');
+                
+                if (e.dataTransfer.files.length > 0) {
+                    addFiles(Array.from(e.dataTransfer.files));
+                }
+            });
+        }
+        
+        function addFiles(files) {
+            files.forEach(file => {
+                if (file.size > {{ MAX_FILE_SIZE }}) {
+                    showError(`File ${file.name} is too large (max 10MB)`);
+                    return;
+                }
+                
+                // Check if file already exists
+                const exists = selectedFiles.some(f => f.name === file.name && f.size === file.size);
+                if (!exists) {
+                    selectedFiles.push(file);
+                }
+            });
+            
+            updateFileList();
+        }
+        
+        function updateFileList() {
+            const fileList = document.getElementById('fileList');
+            
+            if (selectedFiles.length === 0) {
+                fileList.style.display = 'none';
+                return;
+            }
+            
+            fileList.style.display = 'block';
+            fileList.innerHTML = '';
+            
+            selectedFiles.forEach((file, index) => {
+                const fileItem = document.createElement('div');
+                fileItem.className = 'file-item';
+                fileItem.innerHTML = `
+                    <span>📎 ${file.name} (${formatFileSize(file.size)})</span>
+                    <button class="file-remove" onclick="removeFile(${index})">✕</button>
+                `;
+                fileList.appendChild(fileItem);
+            });
+        }
+        
+        function removeFile(index) {
+            selectedFiles.splice(index, 1);
+            updateFileList();
+        }
+        
+        function updateUserCount(count) {
+            document.getElementById('userCount').textContent = `${count} user${count !== 1 ? 's' : ''} online`;
+        }
+        
+        function scrollToBottom() {
+            const messages = document.getElementById('messages');
+            messages.scrollTop = messages.scrollHeight;
+        }
+        
+        function formatFileSize(bytes) {
+            if (bytes === 0) return '0 B';
+            const k = 1024;
+            const sizes = ['B', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+        }
+        
+        // Initialize chat when page loads
+        document.addEventListener('DOMContentLoaded', initializeChat);
+        {% endif %}
+        
+        // Utility functions
+        function showError(message) {
+            const errorDiv = document.getElementById('error');
+            if (errorDiv) {
+                errorDiv.textContent = message;
+                errorDiv.style.display = 'block';
+                setTimeout(() => {
+                    errorDiv.style.display = 'none';
+                }, 5000);
+            }
+        }
+        
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+        
+        // Handle Enter key on login
+        {% if page == 'login' %}
+        document.addEventListener('DOMContentLoaded', function() {
+            document.getElementById('password').addEventListener('keydown', function(e) {
+                if (e.key === 'Enter') {
+                    login();
+                }
+            });
+        });
+        {% endif %}
+        
+        // Handle Enter key on room entry
+        {% if page == 'room_entry' %}
+        document.addEventListener('DOMContentLoaded', function() {
+            const inputs = ['username', 'roomkey'];
+            inputs.forEach(inputId => {
+                document.getElementById(inputId).addEventListener('keydown', function(e) {
+                    if (e.key === 'Enter') {
+                        joinRoom();
+                    }
+                });
+            });
+        });
+        {% endif %}
+    </script>
+</body>
+</html>
+"""
 
-@app.route('/join_chat', methods=['POST'])
-def join_chat():
-    """Join chat session"""
+def cleanup_expired_sessions():
+    """Remove expired sessions"""
+    current_time = time.time()
+    expired_sessions = []
+    
+    for session_id, session_data in SESSIONS.items():
+        if current_time - session_data['created_at'] > SESSION_TIMEOUT:
+            expired_sessions.append(session_id)
+    
+    for session_id in expired_sessions:
+        del SESSIONS[session_id]
+        print(f"Cleaned up expired session: {session_id}")
+    
+    # Schedule next cleanup
+    threading.Timer(300, cleanup_expired_sessions).start()  # Check every 5 minutes
+
+def generate_qr_code(url):
+    """Generate QR code for session URL"""
+    qr = qrcode.QRCode(version=1, box_size=10, border=5)
+    qr.add_data(url)
+    qr.make(fit=True)
+    
+    img = qr.make_image(fill_color="white", back_color="black")
+    buffer = BytesIO()
+    img.save(buffer, format='PNG')
+    buffer.seek(0)
+    
+    return base64.b64encode(buffer.getvalue()).decode()
+
+@app.route('/')
+def index():
+    return render_template_string(HTML_TEMPLATE, page='login')
+
+@app.route('/login', methods=['POST'])
+def login():
     data = request.get_json()
-    session_id = data.get('session_id')
-    username = data.get('username')
-    session_key = data.get('session_key')
+    password = data.get('password', '')
     
-    if not all([session_id, username, session_key]):
-        return jsonify({'success': False, 'error': 'Missing required fields'})
+    if password != FIXED_PASSWORD:
+        return jsonify({'success': False, 'error': 'Invalid password'})
     
-    if not session_key.isdigit() or len(session_key) != 11:
-        return jsonify({'success': False, 'error': 'Session key must be 11 digits'})
+    # Create new session
+    session_id = str(uuid.uuid4())[:8]
+    SESSIONS[session_id] = {
+        'created_at': time.time(),
+        'rooms': {}
+    }
     
-    # Initialize chat session if not exists
-    if session_key not in chat_sessions:
-        chat_sessions[session_key] = {
+    return jsonify({
+        'success': True,
+        'redirect': f'/session/{session_id}'
+    })
+
+@app.route('/session/<session_id>')
+def session_page(session_id):
+    if session_id not in SESSIONS:
+        return render_template_string(HTML_TEMPLATE, page='login')
+    
+    session_url = f"{request.host_url}{session_id}"
+    qr_code = generate_qr_code(session_url)
+    
+    return render_template_string(HTML_TEMPLATE, 
+                                page='session',
+                                session_url=session_url,
+                                qr_code=qr_code)
+
+@app.route('/<session_id>')
+def room_entry(session_id):
+    if session_id not in SESSIONS:
+        return render_template_string(HTML_TEMPLATE, page='login')
+    
+    return render_template_string(HTML_TEMPLATE, 
+                                page='room_entry',
+                                session_id=session_id)
+
+@app.route('/chat/<session_id>/<room_key>/<username>')
+def chat_room(session_id, room_key, username):
+    if session_id not in SESSIONS:
+        return redirect(f'/{session_id}')
+    
+    if len(room_key) != 11 or not room_key.isdigit():
+        return redirect(f'/{session_id}')
+    
+    # Initialize room if it doesn't exist
+    if room_key not in SESSIONS[session_id]['rooms']:
+        SESSIONS[session_id]['rooms'][room_key] = {
             'users': [],
             'messages': []
         }
     
-    # Check if maximum users reached
-    if len(chat_sessions[session_key]['users']) >= 5:
-        return jsonify({'success': False, 'error': 'Chat room is full (max 5 users)'})
-    
-    # Add user if not already in session
-    if username not in chat_sessions[session_key]['users']:
-        chat_sessions[session_key]['users'].append(username)
-    
-    return jsonify({'success': True})
+    return render_template_string(HTML_TEMPLATE,
+                                page='chat',
+                                session_id=session_id,
+                                room_key=room_key,
+                                username=username,
+                                MAX_FILE_SIZE=MAX_FILE_SIZE)
 
-@app.route('/send_message', methods=['POST'])
-def send_message():
-    """Send message to chat"""
-    data = request.get_json()
-    session_key = data.get('session_key')
-    message = data.get('message')
-    username = data.get('username')
+@app.route('/api/messages/<session_id>/<room_key>')
+def get_messages(session_id, room_key):
+    if session_id not in SESSIONS or room_key not in SESSIONS[session_id]['rooms']:
+        return jsonify({'success': False, 'error': 'Room not found'})
     
-    if not all([session_key, message, username]):
-        return jsonify({'success': False, 'error': 'Missing required fields'})
-    
-    if session_key not in chat_sessions:
-        return jsonify({'success': False, 'error': 'Invalid session'})
-    
-    # Check if whisper message
-    is_whisper = message.startswith('!whisper ')
-    if is_whisper:
-        message = message[9:]  # Remove !whisper prefix
-    
-    # Encrypt message
-    key = generate_key_from_session_key(session_key)
-    encrypted_message = encrypt_data(message, key)
-    
-    message_data = {
-        'id': secrets.token_hex(8),
-        'username': username,
-        'message': encrypted_message,
-        'timestamp': datetime.now().strftime('%H:%M:%S'),
-        'whisper': is_whisper,
-        'whisper_time': datetime.now() if is_whisper else None,
-        'type': 'text'
-    }
-    
-    chat_sessions[session_key]['messages'].append(message_data)
-    
-    return jsonify({'success': True})
+    messages = SESSIONS[session_id]['rooms'][room_key]['messages']
+    return jsonify({'success': True, 'messages': messages})
 
-@app.route('/upload_files', methods=['POST'])
+@app.route('/upload', methods=['POST'])
 def upload_files():
-    """Upload files to chat"""
-    session_key = request.form.get('session_key')
+    session_id = request.form.get('session_id')
+    room_key = request.form.get('room_key')
     username = request.form.get('username')
     
-    if not all([session_key, username]):
-        return jsonify({'success': False, 'error': 'Missing required fields'})
+    if not all([session_id, room_key, username]):
+        return jsonify({'success': False, 'error': 'Missing parameters'})
     
-    if session_key not in chat_sessions:
-        return jsonify({'success': False, 'error': 'Invalid session'})
+    if session_id not in SESSIONS or room_key not in SESSIONS[session_id]['rooms']:
+        return jsonify({'success': False, 'error': 'Room not found'})
     
-    uploaded_files = request.files.getlist('files')
-    if not uploaded_files:
+    files = request.files.getlist('files')
+    if not files:
         return jsonify({'success': False, 'error': 'No files uploaded'})
     
-    key = generate_key_from_session_key(session_key)
+    # Process files
+    file_data = []
+    uploaded_files = {}
     
-    for file in uploaded_files:
-        if file.filename == '':
-            continue
+    for file in files:
+        if file.filename:
+            file_content = file.read()
+            if len(file_content) > MAX_FILE_SIZE:
+                continue
             
-        if len(file.read()) > MAX_FILE_SIZE:
-            return jsonify({'success': False, 'error': f'File {file.filename} too large'})
-        
-        file.seek(0)  # Reset file pointer
-        file_data = file.read()
-        
-        # Encrypt file data
-        encrypted_data = encrypt_data(file_data, key)
-        
-        file_id = secrets.token_hex(16)
-        files[file_id] = {
-            'data': encrypted_data,
-            'filename': file.filename,
-            'size': len(file_data),
-            'mimetype': file.mimetype or 'application/octet-stream'
-        }
-        
-        # Add file message
-        message_data = {
-            'id': secrets.token_hex(8),
-            'username': username,
-            'timestamp': datetime.now().strftime('%H:%M:%S'),
-            'whisper': False,
-            'type': 'file',
-            'file_id': file_id,
-            'filename': file.filename,
-            'filesize': f"{len(file_data)/1024/1024:.2f}MB"
-        }
-        
-        chat_sessions[session_key]['messages'].append(message_data)
+            file_info = {
+                'name': file.filename,
+                'size': len(file_content),
+                'type': file.content_type or 'application/octet-stream'
+            }
+            
+            file_data.append(file_info)
+            uploaded_files[file.filename] = file_content
+    
+    if not file_data:
+        return jsonify({'success': False, 'error': 'No valid files to upload'})
+    
+    # Create message
+    message_id = str(uuid.uuid4())
+    message = {
+        'id': message_id,
+        'sender': username,
+        'content': json.dumps(file_data),
+        'type': 'file',
+        'timestamp': time.time(),
+        'whisper': False
+    }
+    
+    # Store files in session data
+    if 'files' not in SESSIONS[session_id]:
+        SESSIONS[session_id]['files'] = {}
+    
+    SESSIONS[session_id]['files'][message_id] = uploaded_files
+    
+    # Add to room messages
+    SESSIONS[session_id]['rooms'][room_key]['messages'].append(message)
+    
+    # Emit to room
+    socketio.emit('file_uploaded', message, room=f"{session_id}_{room_key}")
     
     return jsonify({'success': True})
 
-@app.route('/delete_message', methods=['POST'])
-def delete_message():
-    """Delete message from chat"""
-    data = request.get_json()
-    session_key = data.get('session_key')
-    message_id = data.get('message_id')
-    username = data.get('username')
+@app.route('/file/<message_id>/<filename>')
+def download_file(message_id, filename):
+    # Find the session containing this file
+    for session_id, session_data in SESSIONS.items():
+        if 'files' in session_data and message_id in session_data['files']:
+            if filename in session_data['files'][message_id]:
+                file_content = session_data['files'][message_id][filename]
+                return send_file(
+                    BytesIO(file_content),
+                    as_attachment=True,
+                    download_name=filename
+                )
     
-    if not all([session_key, message_id, username]):
-        return jsonify({'success': False, 'error': 'Missing required fields'})
-    
-    if session_key not in chat_sessions:
-        return jsonify({'success': False, 'error': 'Invalid session'})
-    
-    # Find and remove the message
-    messages = chat_sessions[session_key]['messages']
-    for i, msg in enumerate(messages):
-        if msg['id'] == message_id:
-            # Check if user owns the message or if it's a file, also delete from files storage
-            if msg['username'] == username:
-                if msg.get('type') == 'file' and msg.get('file_id') in files:
-                    del files[msg['file_id']]
-                messages.pop(i)
-                return jsonify({'success': True})
-            else:
-                return jsonify({'success': False, 'error': 'You can only delete your own messages'})
-    
-    return jsonify({'success': False, 'error': 'Message not found'})
+    return jsonify({'error': 'File not found'}), 404
 
-@app.route('/get_messages')
-def get_messages():
-    """Get messages for chat session"""
-    session_key = request.args.get('session_key')
+# Socket.IO Events
+@socketio.on('join')
+def on_join(data):
+    session_id = data['session_id']
+    room_key = data['room_key']
+    username = data['username']
     
-    if not session_key or session_key not in chat_sessions:
-        return jsonify({'success': False, 'error': 'Invalid session'})
+    if session_id not in SESSIONS:
+        return
     
-    messages = chat_sessions[session_key]['messages']
-    key = generate_key_from_session_key(session_key)
+    if room_key not in SESSIONS[session_id]['rooms']:
+        SESSIONS[session_id]['rooms'][room_key] = {
+            'users': [],
+            'messages': []
+        }
     
-    # Filter out expired whisper messages and decrypt
-    current_time = datetime.now()
-    filtered_messages = []
+    room = f"{session_id}_{room_key}"
+    join_room(room)
     
-    for msg in messages:
-        # Remove whisper messages older than 5 seconds
-        if msg.get('whisper') and msg.get('whisper_time'):
-            if current_time - msg['whisper_time'] > timedelta(seconds=5):
-                continue
+    # Add user to room if not already present
+    room_data = SESSIONS[session_id]['rooms'][room_key]
+    if username not in room_data['users']:
+        room_data['users'].append(username)
+    
+    # Store active user
+    ACTIVE_USERS[request.sid] = {
+        'session_id': session_id,
+        'room_key': room_key,
+        'username': username,
+        'room': room
+    }
+    
+    # Notify room of user count
+    emit('user_joined', {
+        'user_count': len(room_data['users'])
+    }, room=room)
+
+@socketio.on('disconnect')
+def on_disconnect():
+    if request.sid in ACTIVE_USERS:
+        user_data = ACTIVE_USERS[request.sid]
+        session_id = user_data['session_id']
+        room_key = user_data['room_key']
+        username = user_data['username']
+        room = user_data['room']
         
-        # Decrypt message if it's text
-        if msg['type'] == 'text':
-            decrypted_message = decrypt_data(msg['message'], key)
-            if decrypted_message:
-                msg_copy = msg.copy()
-                msg_copy['message'] = decrypted_message.decode()
-                filtered_messages.append(msg_copy)
-        else:
-            filtered_messages.append(msg)
-    
-    return jsonify({'success': True, 'messages': filtered_messages})
+        # Remove user from room
+        if session_id in SESSIONS and room_key in SESSIONS[session_id]['rooms']:
+            room_data = SESSIONS[session_id]['rooms'][room_key]
+            if username in room_data['users']:
+                room_data['users'].remove(username)
+            
+            # Notify room of user count
+            emit('user_left', {
+                'user_count': len(room_data['users'])
+            }, room=room)
+        
+        del ACTIVE_USERS[request.sid]
 
-@app.route('/download_file/<file_id>')
-def download_file(file_id):
-    """Download and decrypt file"""
-    if file_id not in files:
-        return "File not found", 404
+@socketio.on('send_message')
+def on_send_message(data):
+    session_id = data['session_id']
+    room_key = data['room_key']
+    username = data['username']
+    message = data['message']
+    is_whisper = data.get('whisper', False)
     
-    # Get session key from referer or request
-    session_key = request.args.get('session_key')
-    if not session_key:
-        # Try to extract from any active session
-        for sk in chat_sessions.keys():
-            session_key = sk
-            break
+    if session_id not in SESSIONS or room_key not in SESSIONS[session_id]['rooms']:
+        return
     
-    if not session_key:
-        return "Session not found", 400
+    # Create message object
+    message_data = {
+        'id': str(uuid.uuid4()),
+        'sender': username,
+        'content': message,
+        'type': 'text',
+        'timestamp': time.time(),
+        'whisper': is_whisper
+    }
     
-    file_info = files[file_id]
-    key = generate_key_from_session_key(session_key)
+    # Add to room messages
+    SESSIONS[session_id]['rooms'][room_key]['messages'].append(message_data)
     
-    # Decrypt file data
-    decrypted_data = decrypt_data(file_info['data'], key)
-    if not decrypted_data:
-        return "Failed to decrypt file", 500
+    # Emit to room
+    room = f"{session_id}_{room_key}"
+    emit('message', message_data, room=room)
     
-    return send_file(
-        io.BytesIO(decrypted_data),
-        as_attachment=True,
-        download_name=file_info['filename'],
-        mimetype=file_info['mimetype']
-    )
-
-@app.route('/logout')
-def logout():
-    """Logout user"""
-    user_id = session.get('authenticated')
-    if user_id and user_id in session_activity:
-        del session_activity[user_id]
-    session.clear()
-    return redirect(url_for('login'))
+    # Schedule whisper deletion
+    if is_whisper:
+        def delete_whisper():
+            if session_id in SESSIONS and room_key in SESSIONS[session_id]['rooms']:
+                messages = SESSIONS[session_id]['rooms'][room_key]['messages']
+                SESSIONS[session_id]['rooms'][room_key]['messages'] = [
+                    msg for msg in messages if msg['id'] != message_data['id']
+                ]
+        
+        threading.Timer(WHISPER_TIMEOUT, delete_whisper).start()
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=15005)
+    print("🚀 Starting GhostLine...")
+    print(f"📱 Access URL: http://localhost:5000")
+    print(f"🔑 Password: {FIXED_PASSWORD}")
+    print("💀 Encrypted • Ephemeral • Anonymous")
+    
+    # Start cleanup timer
+    cleanup_expired_sessions()
+    
+    # Run the application
+    socketio.run(app, host='0.0.0.0', port=5000, debug=False)
