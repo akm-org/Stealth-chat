@@ -7,6 +7,7 @@ cryptography==41.0.7
 # QR code generation with PIL support
 qrcode[pil]==7.4.2
 flask_socketio==5.3.2
+eventlet
 # Additional dependencies (automatically installed with above packages)
 # Werkzeug==2.3.7  # Flask dependency
 # Jinja2==3.1.2     # Flask templating
