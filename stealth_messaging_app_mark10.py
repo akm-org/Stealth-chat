@@ -2380,11 +2380,9 @@ def download_file(file_id):
 
 if __name__ == "__main__":
     print("[INFO] Starting Enhanced Stealth Messaging App with Command Module...")
-    print("[INFO] Access via: https://your-app.onrender.com/?user=demigod or /?user=human")
+    print("[INFO] Access via: http://localhost:8080/?user=demigod or http://localhost:8080/?user=human")
     print("[INFO] Default passwords: demigod='Demig0d@', human='secret123'")
     print("[INFO] Features: WebSocket real-time messaging, Copy/Delete messages, Session expiry (30 min)")
     print("[INFO] Admin commands: /nuke, /revive, /cloak, /uncloak, /impersonate, /help, /status")
     print("[INFO] Special messages: !whisper [message] (temporary message), !alert [message] (high-priority alert)")
-
-    port = int(os.environ.get("PORT", 8080))  # Render provides $PORT
-    socketio.run(app, host="0.0.0.0", port=port)
+    socketio.run(app, host="localhost", port=8080, debug=True, allow_unsafe_werkzeug=True)
