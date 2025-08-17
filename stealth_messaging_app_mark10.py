@@ -305,7 +305,7 @@ def init_users():
     """Initialize default users with bcrypt hashed passwords."""
     global users
     users["demigod"] = {
-        "password": bcrypt.hashpw("Demig0d@".encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+        "password": bcrypt.hashpw("1234567".encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
     }
     users["human"] = {
         "password": bcrypt.hashpw("secret123".encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
