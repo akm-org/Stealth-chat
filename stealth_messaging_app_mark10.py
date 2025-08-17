@@ -2385,4 +2385,4 @@ if __name__ == "__main__":
     print("[INFO] Features: WebSocket real-time messaging, Copy/Delete messages, Session expiry (30 min)")
     print("[INFO] Admin commands: /nuke, /revive, /cloak, /uncloak, /impersonate, /help, /status")
     print("[INFO] Special messages: !whisper [message] (temporary message), !alert [message] (high-priority alert)")
-    socketio.run(app, host="localhost", port=8080, debug=True, allow_unsafe_werkzeug=True)
+    socketio.run(app, host="localhost", port=65100, debug=True, allow_unsafe_werkzeug=True)
