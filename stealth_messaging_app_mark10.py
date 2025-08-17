@@ -255,4 +255,5 @@ def on_join(data):
 
 if __name__ == "__main__":
     print("🚀 Stealth Chat running at http://localhost:8080/?user=demigod (password: admin123)")
-    socketio.run(app, host="0.0.0.0", port=8080, debug=True)
+    socketio.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)),
+             debug=False, allow_unsafe_werkzeug=True)
